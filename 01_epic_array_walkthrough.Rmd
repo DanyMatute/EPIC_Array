@@ -1,0 +1,549 @@
+---
+title: "epic_array_walkthrough"
+output: html_document
+date: "2026-07-08"
+Purpose: learn the EPIC array workflow from start to finish.
+Audience: me, future me, and maybe GitHub readers.
+---
+
+# EPPIC Array Workflow:
+
+1.  Raw Data Import: Loading .idat files containing fluorescent intensities from both red and green channels
+2.  Quality Control: Assessing sample and probe quality using detection p-values and signal distributions
+3.  Preprocessing: Background correction, normalization to account for probe type differences, and probe filtering
+4.  Methylation Quantification: Converting red/green signal ratios to beta-values and M-values
+5.  Batch Effect Correction: Removing technical variation while preserving biological signals. I
+6.  Statistical Analysis: Identifying differentially methylated positions (DMPs) and regions (DMRs)
+7.  Biological Interpretation: Annotating results and performing pathway enrichment analysis
+
+## 0. Set Up Environment
+
+Sets the global option in an R Markdown or Quarto document to display both the source code and its results in the final rendered file.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Install Packages/Libraries
+
+```{r bioconductor}
+# Install essential Bioconductor packages
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install(version = "3.21")
+```
+
+```{r package_installation}
+# Core methylation analysis packages
+essential_packages <- c(
+    "minfi",              # Core package for Illumina methylation arrays
+    "missMethyl",         # Specialized functions for methylation analysis
+    "limma",              # Linear models for differential analysis
+    "DMRcate",            # Differential methylated regions detection
+    "sva",                # Surrogate variable analysis for batch effects
+    "IlluminaHumanMethylationEPICv2anno.20a1.hg38", # EPIC v2.0 annotations
+    "IlluminaHumanMethylationEPICv2manifest",        # EPIC v2.0 manifest
+    "TxDb.Hsapiens.UCSC.hg38.knownGene",             # Gene annotations
+    "org.Hs.eg.db",                                  # Gene symbol mappings
+    "ggplot2",            # General plotting
+    "pheatmap",           # Heatmap visualization
+    "RColorBrewer",       # Color palettes
+    "dplyr",              # Data manipulation
+    "reshape2"            # Data reshaping
+)
+
+BiocManager::install(essential_packages, update = TRUE, ask = FALSE)
+```
+
+```{r load_libraries}
+# Load essential libraries
+library(minfi)
+library(limma)
+library(DMRcate)
+library(sva)
+library(dplyr)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+```
+
+```{r r_optimization}
+# Configure R session options for optimal performance
+options(
+    stringsAsFactors = FALSE,
+    scipen = 999,
+    max.print = 100,
+    width = 120
+)
+set.seed(12345)
+```
+
+## 1. Raw data Import
+
+```{r sample_file_collection}
+library(here)
+
+# Extract sample information from filenames
+# The file naming convention contains important sample metadata
+idat_files <- list.files(
+  path = here::here("data", "raw"),
+  pattern = "\\.idat\\.gz$",
+  full.names = TRUE
+)
+
+red_files <- idat_files[grepl("_Red\\.idat\\.gz$", idat_files)]
+
+basenames <- sub("_Red\\.idat\\.gz$", "", red_files)
+
+sample_info <- data.frame(
+  Basename = basenames,
+  Sample_Name = basename(basenames),
+  stringsAsFactors = FALSE
+)
+
+```
+
+```{r metadata_dataframe_creation}
+# Create sample information dataframe
+sample_info <- data.frame(
+    Basename = basenames,
+    Sample_Name = basename(basenames),
+    stringsAsFactors = FALSE
+)
+```
+
+```{r parse_metadata_toDF}
+# Parse sample types from filenames (extract biological information)
+sample_info$Sample_Type <- sapply(sample_info$Sample_Name, function(x) {
+    if(grepl("PREC", x)) return("PREC")      # Prostate cancer cell line
+    if(grepl("LNCAP", x)) return("LNCAP")    # Prostate cancer cell line
+    if(grepl("SYN", x)) return("SYN")        # Synthetic control
+    if(grepl("MCF7", x)) return("MCF7")      # Breast cancer cell line
+    if(grepl("TAMR", x)) return("TAMR")      # Tamoxifen-resistant cell line
+    if(grepl("FD", x)) return("FD")          # Control condition
+    return("Unknown")
+})
+ 
+# Extract treatment information from filenames
+sample_info$Treatment <- sapply(sample_info$Sample_Name, function(x) {
+    if(grepl("500", x)) return("500")        # High concentration treatment
+    if(grepl("250", x)) return("250")        # Medium concentration treatment
+    if(grepl("125", x)) return("125")        # Low concentration treatment
+    if(grepl("Aza", x)) return("Aza")        # 5-azacytidine treatment
+    if(grepl("NoAza", x)) return("NoAza")    # No treatment control
+    return("Control")
+})
+ 
+# Create simplified grouping for statistical analysis
+sample_info$Group <- paste(sample_info$Sample_Type, sample_info$Treatment, sep = "_")
+sample_info$Group[sample_info$Group == "FD_Control"] <- "FD"
+sample_info$Group[sample_info$Group == "MCF7_Control"] <- "MCF7"
+ 
+# Add technical variables that may affect data quality
+sample_info$Slide <- "GSE240469"     
+
+# Experimental batch identifier
+sample_info$Array <- "EPICv2"              # Array type
+ 
+```
+
+```{r save_metadata}
+# Save sample sheet for future reference
+library(here)
+
+dir.create(here("config"), showWarnings = FALSE, recursive = TRUE)
+
+write.csv(
+  sample_info,
+  here("config", "samplesheet.csv"),
+  row.names = FALSE
+)
+
+file.exists(here("config", "samplesheet.csv"))
+```
+
+```{r import_array_data}
+# Import methylation data using the sample information
+# This function reads both red and green .idat files for each sample
+rgSet <- read.metharray.exp(targets = sample_info, recursive = TRUE, extended = TRUE, force = TRUE)
+ 
+# Get probe information to understand array content
+probe_info <- getProbeInfo(rgSet)
+```
+
+```{r CHECKPOINT_1}
+# Checkpoint 1: after reading IDATs
+saveRDS(
+  list(
+    rgSet = rgSet,
+    sample_info = sample_info
+  ),
+  here::here("data", "processed", "01_raw_import.rds")
+)
+```
+
+## 2. Quality Control
+
+```{r quality_control}
+
+# Load Checkpoint Data
+CP1 <- readRDS(here::here("data", "processed", "01_raw_import.rds"))
+list2env(CP1, envir = .GlobalEnv)
+
+# Calculate detection p-values for all probes and samples
+# These p-values indicate whether each probe's signal is above background
+detP <- detectionP(rgSet)
+ 
+# Set quality control thresholds
+detP_threshold <- 0.01          # Probes with p > 0.01 are considered "failed"
+sample_failure_rate <- 0.05     # Remove samples with >5% failed probes
+probe_failure_rate <- 0.10      # Remove probes that fail in >10% of samples
+ 
+# Identify failed probes and samples using these criteria
+failed_probes <- rowMeans(detP > detP_threshold, na.rm = TRUE) > probe_failure_rate
+failed_samples <- colMeans(detP > detP_threshold, na.rm = TRUE) > sample_failure_rate
+ 
+# Create quality control plots to visualize data quality
+while (!is.null(dev.list())) dev.off()
+pdf("results/01_raw_qc/qc_summary.pdf", width = 12, height = 8)
+par(mfrow = c(2, 2))
+ 
+# Plot sample failure rates
+sample_failure_rates <- colMeans(detP > detP_threshold, na.rm = TRUE)
+barplot(sample_failure_rates, main = "Sample Quality Assessment", 
+        ylab = "Proportion of Failed Probes", las = 2, cex.names = 0.7,
+        col = ifelse(sample_failure_rates > sample_failure_rate, "red", "lightblue"))
+abline(h = sample_failure_rate, col = "red", lwd = 2, lty = 2)
+ 
+# Plot probe failure distribution
+probe_failure_rates <- rowMeans(detP > detP_threshold, na.rm = TRUE)
+hist(probe_failure_rates, main = "Probe Quality Distribution", 
+     xlab = "Proportion of Failed Samples", breaks = 50, col = "lightblue")
+abline(v = probe_failure_rate, col = "red", lwd = 2, lty = 2)
+ 
+dev.off()
+ 
+# Generate comprehensive quality control report
+qcReport(rgSet)
+ 
+# Remove poor quality samples if any are detected
+if(any(failed_samples)) {
+    rgSet <- rgSet[, !failed_samples]
+    sample_info <- sample_info[!failed_samples, ]
+    cat("Removed", sum(failed_samples), "poor quality samples\n")
+} else {
+    cat("All samples passed quality control\n")
+}
+```
+
+```{r CHECKPOINT_2}
+# Checkpoint 2: after QC
+saveRDS(
+  list(
+    rgSet = rgSet,
+    sample_info = sample_info,
+    detP = detP,
+    failed_probes = failed_probes,
+    failed_samples = failed_samples
+  ),
+  here::here("data", "processed", "02_qc.rds")
+)
+```
+
+## 3. Preprocessing
+
+```{r normalization_Beta&Mvalues}
+# Load Checkpoint Data
+CP2 <- readRDS(here::here("data", "processed", "02_qc.rds"))
+list2env(CP2, envir = .GlobalEnv)
+
+# Apply functional normalization to correct for technical variation
+mSet_norm <- preprocessFunnorm(rgSet, nPCs = 2, sex = NULL, bgCorr = TRUE, dyeCorr = TRUE)
+ 
+# Remove failed probes after normalization
+if(any(failed_probes)) {
+    common_probes <- intersect(rownames(mSet_norm), names(failed_probes))
+    failed_probes_subset <- failed_probes[common_probes]
+    mSet_norm <- mSet_norm[!failed_probes_subset, ]
+    cat("Removed", sum(failed_probes_subset), "failed probes\n")
+    } else {
+    cat("All probes passed quality control\n")
+  }
+ 
+# Extract beta-values and M-values (explained in detail below)
+beta_values <- getBeta(mSet_norm)
+m_values <- getM(mSet_norm)
+```
+
+```{r CHECKPONT_3}
+# Checkpoint 3: after normalization
+saveRDS(
+  list(
+    mSet_norm = mSet_norm,
+    beta_values = beta_values,
+    m_values = m_values,
+    sample_info = sample_info,
+    failed_probes = failed_probes
+  ),
+  here::here("data", "processed", "03_normalized.rds")
+)
+```
+
+```{r probe_filering}
+# Load Checkpoint Data
+norm_obj <- readRDS(here::here("data", "processed", "03_normalized.rds"))
+list2env(norm_obj, envir = .GlobalEnv)
+
+# Get comprehensive annotation data for all probes
+annotation <- getAnnotation(mSet_norm)
+ 
+# Identify problematic probes that should be removed:
+# 1. Cross-reactive probes (may bind to multiple genomic locations)
+# 2. Probes affected by SNPs (genetic variants can affect binding)
+cross_reactive <- rownames(annotation)[!is.na(annotation$Probe_rs) | 
+                                      !is.na(annotation$CpG_rs) | 
+                                      !is.na(annotation$SBE_rs)]
+ 
+# 3. Sex chromosome probes (remove to avoid sex-related confounding)
+sex_chr_probes <- rownames(annotation)[annotation$chr %in% c("chrX", "chrY")]
+ 
+# Combine all problematic probes for removal
+problematic_probes <- unique(c(cross_reactive, sex_chr_probes))
+keep_probes <- !rownames(mSet_norm) %in% problematic_probes
+ 
+# Apply filtering
+mSet_filtered <- mSet_norm[keep_probes, ]
+beta_filtered <- getBeta(mSet_filtered)
+m_filtered <- getM(mSet_filtered)
+ 
+# Ensure we only keep probes with complete data across all samples
+complete_probes <- complete.cases(m_filtered) & 
+                   apply(m_filtered, 1, function(x) all(is.finite(x)))
+ 
+m_complete <- m_filtered[complete_probes, ]
+beta_complete <- beta_filtered[complete_probes, ]
+```
+
+```{r CHECKPOINT_4}
+saveRDS(
+  list(
+    mSet_filtered = mSet_filtered,
+    beta_filtered = beta_filtered,
+    m_filtered = m_filtered,
+    m_complete = m_complete,
+    beta_complete = beta_complete,
+    annotation = annotation,
+    sample_info = sample_info
+  ),
+  here::here("data", "processed", "04_filtered_methylation.rds")
+)
+```
+
+```{r outlier_detection}
+# Load Checkpoint Data
+norm_obj <- readRDS(here::here("data", "processed", "04_filtered_methylation.rds"))
+list2env(norm_obj, envir = .GlobalEnv)
+
+# Perform Principal Component Analysis (PCA) to identify outliers
+# PCA reduces the high-dimensional methylation data to key patterns
+pca_result <- prcomp(t(m_complete), center = TRUE, scale. = FALSE)
+var_explained <- summary(pca_result)$importance[2, 1:10]
+ 
+# Create visualization of sample relationships
+pdf("results/02_Sample_Outlier_Detection/sample_qc_pca.pdf", width = 12, height = 8)
+par(mfrow = c(2, 2))
+ 
+# Plot samples in PC space, colored by sample type
+plot(pca_result$x[,1], pca_result$x[,2],
+     main = "PCA: Sample Clustering by Methylation Patterns",
+     xlab = paste0("PC1 (", round(var_explained[1] * 100, 1), "%)"),
+     ylab = paste0("PC2 (", round(var_explained[2] * 100, 1), "%)"),
+     col = as.factor(sample_info$Sample_Type),
+     pch = 16, cex = 1.2)
+legend("topright", legend = unique(sample_info$Sample_Type), 
+       col = 1:length(unique(sample_info$Sample_Type)), pch = 16, cex = 0.8)
+ 
+# Create sample correlation heatmap
+sample_cors <- cor(beta_filtered, use = "complete.obs")
+library(pheatmap)
+pheatmap(sample_cors, 
+         annotation_col = data.frame(Type = sample_info$Sample_Type, 
+                                   row.names = colnames(sample_cors)),
+         show_rownames = FALSE, show_colnames = FALSE,
+         main = "Sample-to-Sample Correlations")
+ 
+dev.off()
+ 
+# Statistical outlier detection using Mahalanobis distance
+pc_scores <- pca_result$x[, 1:5]
+mahal_dist <- mahalanobis(pc_scores, colMeans(pc_scores), cov(pc_scores))
+outlier_threshold <- qchisq(0.975, df = 5)
+outliers <- names(mahal_dist)[mahal_dist > outlier_threshold]
+ 
+if(length(outliers) > 0) {
+    cat("Outlier samples detected:", paste(outliers, collapse = ", "), "\n")
+    cat("Consider investigating these samples for technical issues\n")
+} else {
+    cat("No outlier samples detected - data quality looks good\n")
+}
+```
+
+## 4. Differential Methylation Analysis
+
+```{r differential_metylation_analysis_prep}
+# Load Checkpoint Data
+filtered_obj <- readRDS(here::here("data", "processed", "04_filtered_methylation.rds"))
+list2env(filtered_obj, envir = .GlobalEnv)
+
+# Define comparison groups for analysis
+# For this example, we'll compare LNCAP vs PREC cell lines
+sample_info$Comparison_Group <- ifelse(sample_info$Sample_Type %in% c("LNCAP", "PREC"), 
+                                      sample_info$Sample_Type, "Other")
+
+# Filter to only include samples in our comparison
+comparison_samples <- sample_info$Comparison_Group %in% c("LNCAP", "PREC")
+m_comparison <- m_filtered[, comparison_samples]
+sample_info_comparison <- sample_info[comparison_samples, ]
+ 
+# Create design matrix for statistical modeling
+# This matrix tells the statistical model which samples belong to which groups
+design <- model.matrix(~ 0 + Comparison_Group, data = sample_info_comparison)
+colnames(design) <- gsub("Comparison_Group", "", colnames(design))
+ 
+# Define the specific contrast we want to test
+# This specifies exactly which comparison we're making
+contrast_matrix <- makeContrasts(
+    Group_Diff = paste0(colnames(design)[1], "-", colnames(design)[2]), 
+    levels = design
+)
+ 
+# Fit linear models to identify differentially methylated positions
+# We use M-values here because they have better statistical properties
+fit <- lmFit(m_comparison, design)
+fit_contrasts <- contrasts.fit(fit, contrast_matrix)
+fit_eb <- eBayes(fit_contrasts)
+ 
+# Extract results with statistical significance testing
+results_all <- topTable(fit_eb, coef = colnames(contrast_matrix), 
+                       n = Inf, p.value = 1, lfc = 0, sort.by = "p")
+ 
+# Add genomic annotation to understand where differences occur
+annotation_subset <- annotation[rownames(results_all), ]
+results_annotated <- cbind(results_all, annotation_subset)
+ 
+# Save results for further analysis
+write.csv(results_annotated, "results/03_Differential/dmp_results_annotated.csv")
+
+```
+
+```{r CHECKPOINT_5}
+saveRDS(
+  list(
+    m_comparison = m_comparison,
+    sample_info_comparison = sample_info_comparison,
+    design = design,
+    contrast_matrix = contrast_matrix,
+    fit_eb = fit_eb,
+    results_all = results_all,
+    results_annotated = results_annotated
+  ),
+  here::here("data", "processed", "05_differential_methylation.rds")
+)
+```
+
+## 5. Batch Effect
+
+```{r batch_effect}
+# Example batch effect correction using ComBat
+library(sva)
+ 
+# Identify batch effects
+batch_variable <- sample_info$Processing_Date  # or other batch identifier
+mod <- model.matrix(~ Sample_Type, data = sample_info)
+ 
+# Apply ComBat correction
+m_combat <- ComBat(dat = m_values, batch = batch_variable, mod = mod)
+
+## 9. Functional Enrichment Analysis
+```
+
+## 6. Statistical Analysis
+
+```{r differential_metylation_analysis_DMRcate}
+# Load checkpoint data 
+diff_obj <- readRDS(here::here("data", "processed", "05_differential_methylation.rds"))
+list2env(diff_obj, envir = .GlobalEnv)
+
+# DMRcate analysis for identifying differentially methylated regions
+# First, annotate CpGs with statistical information
+dmr_annotation <- cpg.annotate(
+    object = m_comparison,                    # Use M-values for statistical testing
+    datatype = "array",                       # Specify this is array data
+    what = "M",                               # Use M-values
+    arraytype = "EPICv2",                     # Specify EPIC v2.0 array
+    analysis.type = "differential",           # Differential analysis
+    design = design,                          # Design matrix
+    contrasts = TRUE,                         # Use contrasts
+    cont.matrix = contrast_matrix,            # Contrast matrix
+    coef = colnames(contrast_matrix)[1],      # Which contrast to test
+    fdr = 0.05                                # FDR threshold for significance
+)
+ 
+# Find DMRs using spatial correlation of nearby CpGs
+# lambda controls the smoothing bandwidth
+# C controls the minimum number of CpGs required per region
+dmrs <- dmrcate(dmr_annotation, lambda = 1000, C = 2, pcutoff = 0.05)
+ 
+# Extract genomic ranges for the identified DMRs
+dmr_results <- extractRanges(dmrs, genome = "hg38")
+ 
+# Convert to a data frame for easier analysis
+dmr_df <- as.data.frame(dmr_results)
+write.csv(dmr_df, "results/03_Differential/dmr_results.csv")
+```
+
+```{r differential_metylation_analysis_cleanup}
+# Extract unique genes overlapping with DMRs
+# The overlapping.genes column contains gene symbols for each DMR
+dmr_genes <- unique(unlist(strsplit(dmr_df$overlapping.genes, ", ")))
+ 
+# Remove any NA or empty entries
+dmr_genes <- dmr_genes[!is.na(dmr_genes) & dmr_genes != ""]
+```
+
+## 7. Biological Interpretation
+
+```{r gene_enrichment_analysis}
+# Load checkpoint data 
+diff_obj <- readRDS(here::here("data", "processed", "05_differential_methylation.rds"))
+list2env(diff_obj, envir = .GlobalEnv)
+
+# Gene Ontology (GO) enrichment analysis
+# This tests whether genes near differentially methylated CpGs are enriched
+# for specific biological processes, molecular functions, or cellular components
+if (!require("missMethyl", character.only = TRUE)) {
+  library("missMethyl")
+}
+
+go_results <- gometh(
+    sig.cpg = rownames(results_all[results_all$adj.P.Val < 0.05, ]),  # Significant CpGs
+    all.cpg = rownames(results_all),                                   # Background CpGs
+    collection = "GO",                                                 # Gene Ontology
+    array.type = "EPIC_V2"                                            # Array type
+)
+ 
+write.csv(go_results, "results/04_Annotation/go_enrichment_results.csv")
+ 
+# KEGG pathway enrichment analysis
+# This tests for enrichment in specific metabolic and signaling pathways
+kegg_results <- gometh(
+    sig.cpg = rownames(results_all[results_all$adj.P.Val < 0.05, ]),
+    all.cpg = rownames(results_all),
+    collection = "KEGG",                                              # KEGG pathways
+    array.type = "EPIC_V2"
+)
+ 
+write.csv(kegg_results, "results/04_Annotation/kegg_enrichment_results.csv")
+
+```
