@@ -1,4 +1,5 @@
 # EPIC Array Walkthrough
+ACTIVE DEVELOPMENT!!!
 
 A comprehensive R workflow for analyzing Illumina EPIC (Epigenetic Chemical) methylation array data from start to finish.
 
